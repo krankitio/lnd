@@ -8,16 +8,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/roasbeef/btcd/wire"
 )
-
-func init() {
-	// Disable logging to prevent panics bc. of global state
-	channeldb.UseLogger(btclog.Disabled)
-	utxnLog = btclog.Disabled
-}
 
 // makeTestDB creates a new instance of the ChannelDB for testing purposes. A
 // callback which cleans up the created temporary directories is also returned

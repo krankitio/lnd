@@ -5,17 +5,13 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 )
 
-// ErrNotMine is an error denoting that a WalletController instance is unable
-// to spend a specified output.
-var ErrNotMine = errors.New("the passed output doesn't belong to the wallet")
-
-// AddressType is a enum-like type which denotes the possible address types
+// AddressType is an enum-like type which denotes the possible address types
 // WalletController supports.
 type AddressType uint8
 
@@ -32,10 +28,24 @@ const (
 	UnknownAddressType
 )
 
-// ErrDoubleSpend is returned from PublishTransaction in case the
-// tx being published is spending an output spent by a conflicting
-// transaction.
-var ErrDoubleSpend = errors.New("Transaction rejected: output already spent")
+var (
+	// DefaultPublicPassphrase is the default public passphrase used for the
+	// wallet.
+	DefaultPublicPassphrase = []byte("public")
+
+	// DefaultPrivatePassphrase is the default private passphrase used for
+	// the wallet.
+	DefaultPrivatePassphrase = []byte("hello")
+
+	// ErrDoubleSpend is returned from PublishTransaction in case the
+	// tx being published is spending an output spent by a conflicting
+	// transaction.
+	ErrDoubleSpend = errors.New("Transaction rejected: output already spent")
+
+	// ErrNotMine is an error denoting that a WalletController instance is
+	// unable to spend a specified output.
+	ErrNotMine = errors.New("the passed output doesn't belong to the wallet")
+)
 
 // Utxo is an unspent output denoted by its outpoint, and output value of the
 // original output.
@@ -138,26 +148,25 @@ type WalletController interface {
 	// p2wsh, etc.
 	NewAddress(addrType AddressType, change bool) (btcutil.Address, error)
 
-	// GetPrivKey retrieves the underlying private key associated with the
-	// passed address. If the wallet is unable to locate this private key
-	// due to the address not being under control of the wallet, then an
-	// error should be returned.
-	GetPrivKey(a btcutil.Address) (*btcec.PrivateKey, error)
+	// IsOurAddress checks if the passed address belongs to this wallet
+	IsOurAddress(a btcutil.Address) bool
 
-	// SendOutputs funds, signs, and broadcasts a Bitcoin transaction
-	// paying out to the specified outputs. In the case the wallet has
-	// insufficient funds, or the outputs are non-standard, an error should
-	// be returned. This method also takes the target fee expressed in
-	// sat/vbyte that should be used when crafting the transaction.
+	// SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying
+	// out to the specified outputs. In the case the wallet has insufficient
+	// funds, or the outputs are non-standard, an error should be returned.
+	// This method also takes the target fee expressed in sat/kw that should
+	// be used when crafting the transaction.
 	SendOutputs(outputs []*wire.TxOut,
-		feeRate SatPerVByte) (*chainhash.Hash, error)
+		feeRate SatPerKWeight) (*chainhash.Hash, error)
 
 	// ListUnspentWitness returns all unspent outputs which are version 0
-	// witness programs. The 'confirms' parameter indicates the minimum
-	// number of confirmations an output needs in order to be returned by
-	// this method. Passing -1 as 'confirms' indicates that even
-	// unconfirmed outputs should be returned.
-	ListUnspentWitness(confirms int32) ([]*Utxo, error)
+	// witness programs. The 'minconfirms' and 'maxconfirms' parameters
+	// indicate the minimum and maximum number of confirmations an output
+	// needs in order to be returned by this method. Passing -1 as
+	// 'minconfirms' indicates that even unconfirmed outputs should be
+	// returned. Using MaxInt32 as 'maxconfirms' implies returning all
+	// outputs with at least 'minconfirms'.
+	ListUnspentWitness(minconfirms, maxconfirms int32) ([]*Utxo, error)
 
 	// ListTransactionDetails returns a list of all transactions which are
 	// relevant to the wallet.
@@ -169,7 +178,7 @@ type WalletController interface {
 	// usage when funding a channel.
 	LockOutpoint(o wire.OutPoint)
 
-	// UnlockOutpoint unlocks an previously locked output, marking it
+	// UnlockOutpoint unlocks a previously locked output, marking it
 	// eligible for coin selection.
 	UnlockOutpoint(o wire.OutPoint)
 
@@ -227,10 +236,12 @@ type BlockChainIO interface {
 
 	// GetUtxo attempts to return the passed outpoint if it's still a
 	// member of the utxo set. The passed height hint should be the "birth
-	// height" of the passed outpoint. In the case that the output is in
+	// height" of the passed outpoint. The script passed should be the
+	// script that the outpoint creates. In the case that the output is in
 	// the UTXO set, then the output corresponding to that output is
 	// returned.  Otherwise, a non-nil error will be returned.
-	GetUtxo(op *wire.OutPoint, heightHint uint32) (*wire.TxOut, error)
+	GetUtxo(op *wire.OutPoint, pkScript []byte,
+		heightHint uint32) (*wire.TxOut, error)
 
 	// GetBlockHash returns the hash of the block in the best blockchain
 	// at the given height.

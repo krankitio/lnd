@@ -14,20 +14,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/fastsha256"
 	"github.com/coreos/bbolt"
 	"github.com/go-errors/errors"
-	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/lightningnetwork/lnd/ticker"
 )
 
 var (
@@ -116,9 +117,9 @@ func genIDs() (lnwire.ChannelID, lnwire.ChannelID, lnwire.ShortChannelID,
 	return chanID1, chanID2, aliceChanID, bobChanID
 }
 
-// mockGetChanUpdateMessage helper function which returns topology update
-// of the channel
-func mockGetChanUpdateMessage() (*lnwire.ChannelUpdate, error) {
+// mockGetChanUpdateMessage helper function which returns topology update of
+// the channel
+func mockGetChanUpdateMessage(cid lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
 	return &lnwire.ChannelUpdate{
 		Signature: wireSig,
 	}, nil
@@ -271,14 +272,11 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		return nil, nil, nil, nil, err
 	}
 
-	estimator := &lnwallet.StaticFeeEstimator{
-		FeeRate: 24,
-	}
-	feePerVSize, err := estimator.EstimateFeePerVSize(1)
+	estimator := &lnwallet.StaticFeeEstimator{FeePerKW: 6000}
+	feePerKw, err := estimator.EstimateFeePerKW(1)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	feePerKw := feePerVSize.FeePerKWeight()
 	commitFee := feePerKw.FeeForWeight(724)
 
 	const broadcastHeight = 1
@@ -324,7 +322,7 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		RevocationStore:         shachain.NewRevocationStore(),
 		LocalCommitment:         aliceCommit,
 		RemoteCommitment:        aliceCommit,
-		ShortChanID:             chanID,
+		ShortChannelID:          chanID,
 		Db:                      dbAlice,
 		Packager:                channeldb.NewChannelPackager(chanID),
 		FundingTxn:              testTx,
@@ -343,7 +341,7 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		RevocationStore:         shachain.NewRevocationStore(),
 		LocalCommitment:         bobCommit,
 		RemoteCommitment:        bobCommit,
-		ShortChanID:             chanID,
+		ShortChannelID:          chanID,
 		Db:                      dbBob,
 		Packager:                channeldb.NewChannelPackager(chanID),
 	}
@@ -568,22 +566,13 @@ func generateRoute(hops ...ForwardingInfo) ([lnwire.OnionPacketSize]byte, error)
 type threeHopNetwork struct {
 	aliceServer      *mockServer
 	aliceChannelLink *channelLink
-	aliceBlockEpoch  chan *chainntnfs.BlockEpoch
-	aliceTicker      *time.Ticker
-
-	firstBobChannelLink *channelLink
-	bobFirstBlockEpoch  chan *chainntnfs.BlockEpoch
-	firstBobTicker      *time.Ticker
 
 	bobServer            *mockServer
+	firstBobChannelLink  *channelLink
 	secondBobChannelLink *channelLink
-	bobSecondBlockEpoch  chan *chainntnfs.BlockEpoch
-	secondBobTicker      *time.Ticker
 
-	carolChannelLink *channelLink
 	carolServer      *mockServer
-	carolBlockEpoch  chan *chainntnfs.BlockEpoch
-	carolTicker      *time.Ticker
+	carolChannelLink *channelLink
 
 	feeEstimator *mockFeeEstimator
 
@@ -591,7 +580,7 @@ type threeHopNetwork struct {
 }
 
 // generateHops creates the per hop payload, the total amount to be sent, and
-// also the time lock value needed to route a HTLC with the target amount over
+// also the time lock value needed to route an HTLC with the target amount over
 // the specified path.
 func generateHops(payAmt lnwire.MilliSatoshi, startingHeight uint32,
 	path ...*channelLink) (lnwire.MilliSatoshi, uint32, []ForwardingInfo) {
@@ -610,15 +599,17 @@ func generateHops(payAmt lnwire.MilliSatoshi, startingHeight uint32,
 			nextHop = path[i+1].channel.ShortChanID()
 		}
 
+		var timeLock uint32
 		// If this is the last, hop, then the time lock will be their
 		// specified delta policy plus our starting height.
-		totalTimelock += lastHop.cfg.FwrdingPolicy.TimeLockDelta
-		timeLock := totalTimelock
-
-		// Otherwise, the outgoing time lock should be the incoming
-		// timelock minus their specified delta.
-		if i != len(path)-1 {
-			delta := path[i].cfg.FwrdingPolicy.TimeLockDelta
+		if i == len(path)-1 {
+			totalTimelock += lastHop.cfg.FwrdingPolicy.TimeLockDelta
+			timeLock = totalTimelock
+		} else {
+			// Otherwise, the outgoing time lock should be the
+			// incoming timelock minus their specified delta.
+			delta := path[i+1].cfg.FwrdingPolicy.TimeLockDelta
+			totalTimelock += delta
 			timeLock = totalTimelock - delta
 		}
 
@@ -672,8 +663,8 @@ func (r *paymentResponse) Wait(d time.Duration) (chainhash.Hash, error) {
 // * from Alice to Bob
 // * from Alice to Carol through the Bob
 // * from Alice to some another peer through the Bob
-func (n *threeHopNetwork) makePayment(sendingPeer, receivingPeer Peer,
-	firstHopPub [33]byte, hops []ForwardingInfo,
+func (n *threeHopNetwork) makePayment(sendingPeer, receivingPeer lnpeer.Peer,
+	firstHop lnwire.ShortChannelID, hops []ForwardingInfo,
 	invoiceAmt, htlcAmt lnwire.MilliSatoshi,
 	timelock uint32) *paymentResponse {
 
@@ -717,8 +708,9 @@ func (n *threeHopNetwork) makePayment(sendingPeer, receivingPeer Peer,
 
 	// Send payment and expose err channel.
 	go func() {
-		_, err := sender.htlcSwitch.SendHTLC(firstHopPub, htlc,
-			newMockDeobfuscator())
+		_, err := sender.htlcSwitch.SendHTLC(
+			firstHop, htlc, newMockDeobfuscator(),
+		)
 		paymentErr <- err
 	}()
 
@@ -760,11 +752,6 @@ func (n *threeHopNetwork) stop() {
 		n.carolServer.Stop()
 		done <- struct{}{}
 	}()
-
-	n.aliceTicker.Stop()
-	n.firstBobTicker.Stop()
-	n.secondBobTicker.Stop()
-	n.carolTicker.Stop()
 
 	for i := 0; i < 3; i++ {
 		<-done
@@ -856,16 +843,24 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 	bobDb := firstBobChannel.State().Db
 	carolDb := carolChannel.State().Db
 
+	defaultDelta := uint32(6)
+
 	// Create three peers/servers.
-	aliceServer, err := newMockServer(t, "alice", aliceDb)
+	aliceServer, err := newMockServer(
+		t, "alice", startingHeight, aliceDb, defaultDelta,
+	)
 	if err != nil {
 		t.Fatalf("unable to create alice server: %v", err)
 	}
-	bobServer, err := newMockServer(t, "bob", bobDb)
+	bobServer, err := newMockServer(
+		t, "bob", startingHeight, bobDb, defaultDelta,
+	)
 	if err != nil {
 		t.Fatalf("unable to create bob server: %v", err)
 	}
-	carolServer, err := newMockServer(t, "carol", carolDb)
+	carolServer, err := newMockServer(
+		t, "carol", startingHeight, carolDb, defaultDelta,
+	)
 	if err != nil {
 		t.Fatalf("unable to create carol server: %v", err)
 	}
@@ -877,9 +872,16 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 	carolDecoder := newMockIteratorDecoder()
 
 	feeEstimator := &mockFeeEstimator{
-		byteFeeIn: make(chan lnwallet.SatPerVByte),
+		byteFeeIn: make(chan lnwallet.SatPerKWeight),
 		quit:      make(chan struct{}),
 	}
+
+	const (
+		batchTimeout        = 50 * time.Millisecond
+		fwdPkgTimeout       = 15 * time.Second
+		minFeeUpdateTimeout = 30 * time.Minute
+		maxFeeUpdateTimeout = 40 * time.Minute
+	)
 
 	pCache := &mockPreimageCache{
 		// hash -> preimage
@@ -889,19 +891,13 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 	globalPolicy := ForwardingPolicy{
 		MinHTLC:       lnwire.NewMSatFromSatoshis(5),
 		BaseFee:       lnwire.NewMSatFromSatoshis(1),
-		TimeLockDelta: 6,
+		TimeLockDelta: defaultDelta,
 	}
 	obfuscator := NewMockObfuscator()
 
-	aliceEpochChan := make(chan *chainntnfs.BlockEpoch)
-	aliceEpoch := &chainntnfs.BlockEpochEvent{
-		Epochs: aliceEpochChan,
-		Cancel: func() {
-		},
-	}
-	aliceTicker := time.NewTicker(50 * time.Millisecond)
 	aliceChannelLink := NewChannelLink(
 		ChannelLinkConfig{
+			Switch:             aliceServer.htlcSwitch,
 			FwrdingPolicy:      globalPolicy,
 			Peer:               bobServer,
 			Circuits:           aliceServer.htlcSwitch.CircuitModifier(),
@@ -911,24 +907,25 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 				ErrorEncrypter, lnwire.FailCode) {
 				return obfuscator, lnwire.CodeNone
 			},
-			GetLastChannelUpdate: mockGetChanUpdateMessage,
-			Registry:             aliceServer.registry,
-			BlockEpochs:          aliceEpoch,
-			FeeEstimator:         feeEstimator,
-			PreimageCache:        pCache,
+			FetchLastChannelUpdate: mockGetChanUpdateMessage,
+			Registry:               aliceServer.registry,
+			FeeEstimator:           feeEstimator,
+			PreimageCache:          pCache,
 			UpdateContractSignals: func(*contractcourt.ContractSignals) error {
 				return nil
 			},
-			ChainEvents:    &contractcourt.ChainEventSubscription{},
-			SyncStates:     true,
-			BatchTicker:    &mockTicker{aliceTicker.C},
-			FwdPkgGCTicker: &mockTicker{time.NewTicker(5 * time.Second).C},
-			BatchSize:      10,
+			ChainEvents:         &contractcourt.ChainEventSubscription{},
+			SyncStates:          true,
+			BatchSize:           10,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
+			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		aliceChannel,
-		startingHeight,
 	)
-	if err := aliceServer.htlcSwitch.addLink(aliceChannelLink); err != nil {
+	if err := aliceServer.htlcSwitch.AddLink(aliceChannelLink); err != nil {
 		t.Fatalf("unable to add alice channel link: %v", err)
 	}
 	go func() {
@@ -941,15 +938,9 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 		}
 	}()
 
-	bobFirstEpochChan := make(chan *chainntnfs.BlockEpoch)
-	bobFirstEpoch := &chainntnfs.BlockEpochEvent{
-		Epochs: bobFirstEpochChan,
-		Cancel: func() {
-		},
-	}
-	firstBobTicker := time.NewTicker(50 * time.Millisecond)
 	firstBobChannelLink := NewChannelLink(
 		ChannelLinkConfig{
+			Switch:             bobServer.htlcSwitch,
 			FwrdingPolicy:      globalPolicy,
 			Peer:               aliceServer,
 			Circuits:           bobServer.htlcSwitch.CircuitModifier(),
@@ -959,24 +950,25 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 				ErrorEncrypter, lnwire.FailCode) {
 				return obfuscator, lnwire.CodeNone
 			},
-			GetLastChannelUpdate: mockGetChanUpdateMessage,
-			Registry:             bobServer.registry,
-			BlockEpochs:          bobFirstEpoch,
-			FeeEstimator:         feeEstimator,
-			PreimageCache:        pCache,
+			FetchLastChannelUpdate: mockGetChanUpdateMessage,
+			Registry:               bobServer.registry,
+			FeeEstimator:           feeEstimator,
+			PreimageCache:          pCache,
 			UpdateContractSignals: func(*contractcourt.ContractSignals) error {
 				return nil
 			},
-			ChainEvents:    &contractcourt.ChainEventSubscription{},
-			SyncStates:     true,
-			BatchTicker:    &mockTicker{firstBobTicker.C},
-			FwdPkgGCTicker: &mockTicker{time.NewTicker(5 * time.Second).C},
-			BatchSize:      10,
+			ChainEvents:         &contractcourt.ChainEventSubscription{},
+			SyncStates:          true,
+			BatchSize:           10,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
+			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		firstBobChannel,
-		startingHeight,
 	)
-	if err := bobServer.htlcSwitch.addLink(firstBobChannelLink); err != nil {
+	if err := bobServer.htlcSwitch.AddLink(firstBobChannelLink); err != nil {
 		t.Fatalf("unable to add first bob channel link: %v", err)
 	}
 	go func() {
@@ -989,15 +981,9 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 		}
 	}()
 
-	bobSecondEpochChan := make(chan *chainntnfs.BlockEpoch)
-	bobSecondEpoch := &chainntnfs.BlockEpochEvent{
-		Epochs: bobSecondEpochChan,
-		Cancel: func() {
-		},
-	}
-	secondBobTicker := time.NewTicker(50 * time.Millisecond)
 	secondBobChannelLink := NewChannelLink(
 		ChannelLinkConfig{
+			Switch:             bobServer.htlcSwitch,
 			FwrdingPolicy:      globalPolicy,
 			Peer:               carolServer,
 			Circuits:           bobServer.htlcSwitch.CircuitModifier(),
@@ -1007,24 +993,25 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 				ErrorEncrypter, lnwire.FailCode) {
 				return obfuscator, lnwire.CodeNone
 			},
-			GetLastChannelUpdate: mockGetChanUpdateMessage,
-			Registry:             bobServer.registry,
-			BlockEpochs:          bobSecondEpoch,
-			FeeEstimator:         feeEstimator,
-			PreimageCache:        pCache,
+			FetchLastChannelUpdate: mockGetChanUpdateMessage,
+			Registry:               bobServer.registry,
+			FeeEstimator:           feeEstimator,
+			PreimageCache:          pCache,
 			UpdateContractSignals: func(*contractcourt.ContractSignals) error {
 				return nil
 			},
-			ChainEvents:    &contractcourt.ChainEventSubscription{},
-			SyncStates:     true,
-			BatchTicker:    &mockTicker{secondBobTicker.C},
-			FwdPkgGCTicker: &mockTicker{time.NewTicker(5 * time.Second).C},
-			BatchSize:      10,
+			ChainEvents:         &contractcourt.ChainEventSubscription{},
+			SyncStates:          true,
+			BatchSize:           10,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
+			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		secondBobChannel,
-		startingHeight,
 	)
-	if err := bobServer.htlcSwitch.addLink(secondBobChannelLink); err != nil {
+	if err := bobServer.htlcSwitch.AddLink(secondBobChannelLink); err != nil {
 		t.Fatalf("unable to add second bob channel link: %v", err)
 	}
 	go func() {
@@ -1037,15 +1024,9 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 		}
 	}()
 
-	carolBlockEpoch := make(chan *chainntnfs.BlockEpoch)
-	carolEpoch := &chainntnfs.BlockEpochEvent{
-		Epochs: bobSecondEpochChan,
-		Cancel: func() {
-		},
-	}
-	carolTicker := time.NewTicker(50 * time.Millisecond)
 	carolChannelLink := NewChannelLink(
 		ChannelLinkConfig{
+			Switch:             carolServer.htlcSwitch,
 			FwrdingPolicy:      globalPolicy,
 			Peer:               bobServer,
 			Circuits:           carolServer.htlcSwitch.CircuitModifier(),
@@ -1055,24 +1036,25 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 				ErrorEncrypter, lnwire.FailCode) {
 				return obfuscator, lnwire.CodeNone
 			},
-			GetLastChannelUpdate: mockGetChanUpdateMessage,
-			Registry:             carolServer.registry,
-			BlockEpochs:          carolEpoch,
-			FeeEstimator:         feeEstimator,
-			PreimageCache:        pCache,
+			FetchLastChannelUpdate: mockGetChanUpdateMessage,
+			Registry:               carolServer.registry,
+			FeeEstimator:           feeEstimator,
+			PreimageCache:          pCache,
 			UpdateContractSignals: func(*contractcourt.ContractSignals) error {
 				return nil
 			},
-			ChainEvents:    &contractcourt.ChainEventSubscription{},
-			SyncStates:     true,
-			BatchTicker:    &mockTicker{carolTicker.C},
-			FwdPkgGCTicker: &mockTicker{time.NewTicker(5 * time.Second).C},
-			BatchSize:      10,
+			ChainEvents:         &contractcourt.ChainEventSubscription{},
+			SyncStates:          true,
+			BatchSize:           10,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
+			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		carolChannel,
-		startingHeight,
 	)
-	if err := carolServer.htlcSwitch.addLink(carolChannelLink); err != nil {
+	if err := carolServer.htlcSwitch.AddLink(carolChannelLink); err != nil {
 		t.Fatalf("unable to add carol channel link: %v", err)
 	}
 	go func() {
@@ -1088,22 +1070,13 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 	return &threeHopNetwork{
 		aliceServer:      aliceServer,
 		aliceChannelLink: aliceChannelLink.(*channelLink),
-		aliceBlockEpoch:  aliceEpochChan,
-		aliceTicker:      aliceTicker,
-
-		firstBobChannelLink: firstBobChannelLink.(*channelLink),
-		bobFirstBlockEpoch:  bobFirstEpochChan,
-		firstBobTicker:      firstBobTicker,
 
 		bobServer:            bobServer,
+		firstBobChannelLink:  firstBobChannelLink.(*channelLink),
 		secondBobChannelLink: secondBobChannelLink.(*channelLink),
-		bobSecondBlockEpoch:  bobSecondEpochChan,
-		secondBobTicker:      secondBobTicker,
 
-		carolChannelLink: carolChannelLink.(*channelLink),
 		carolServer:      carolServer,
-		carolBlockEpoch:  carolBlockEpoch,
-		carolTicker:      carolTicker,
+		carolChannelLink: carolChannelLink.(*channelLink),
 
 		feeEstimator: feeEstimator,
 		globalPolicy: globalPolicy,

@@ -3,6 +3,7 @@ package macaroons
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path"
 
 	"google.golang.org/grpc"
@@ -18,9 +19,9 @@ import (
 )
 
 var (
-	// dbFileName is the filename within the data directory which contains
+	// DBFilename is the filename within the data directory which contains
 	// the macaroon stores.
-	dbFilename = "macaroons.db"
+	DBFilename = "macaroons.db"
 )
 
 // Service encapsulates bakery.Bakery and adds a Close() method that zeroes the
@@ -40,10 +41,18 @@ type Service struct {
 // such as those for `allow`, `time-before`, `declared`, and `error` caveats
 // are registered automatically and don't need to be added.
 func NewService(dir string, checks ...Checker) (*Service, error) {
+	// Ensure that the path to the directory exists.
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, err
+		}
+	}
+
 	// Open the database that we'll use to store the primary macaroon key,
 	// and all generated macaroons+caveats.
-	macaroonDB, err := bolt.Open(path.Join(dir, dbFilename), 0600,
-		bolt.DefaultOptions)
+	macaroonDB, err := bolt.Open(
+		path.Join(dir, DBFilename), 0600, bolt.DefaultOptions,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +94,9 @@ func isRegistered(c *checkers.Checker, name string) bool {
 	}
 
 	for _, info := range c.Info() {
-		if info.Name == name && info.Prefix == "std" {
+		if info.Name == name &&
+			info.Prefix == "" &&
+			info.Namespace == "std" {
 			return true
 		}
 	}

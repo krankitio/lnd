@@ -9,18 +9,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/txscript"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
-	"github.com/roasbeef/btcwallet/chain"
-	"github.com/roasbeef/btcwallet/waddrmgr"
-	base "github.com/roasbeef/btcwallet/wallet"
-	"github.com/roasbeef/btcwallet/walletdb"
 )
 
 const (
@@ -81,35 +80,43 @@ func New(cfg Config) (*BtcWallet, error) {
 		Coin:    cfg.CoinType,
 	}
 
-	var pubPass []byte
-	if cfg.PublicPass == nil {
-		pubPass = defaultPubPassphrase
-	} else {
-		pubPass = cfg.PublicPass
-	}
-
-	loader := base.NewLoader(cfg.NetParams, netDir)
-	walletExists, err := loader.WalletExists()
-	if err != nil {
-		return nil, err
-	}
-
-	var wallet *base.Wallet
-	if !walletExists {
-		// Wallet has never been created, perform initial set up.
-		wallet, err = loader.CreateNewWallet(
-			pubPass, cfg.PrivatePass, cfg.HdSeed,
-		)
+	// Maybe the wallet has already been opened and unlocked by the
+	// WalletUnlocker. So if we get a non-nil value from the config,
+	// we assume everything is in order.
+	var wallet = cfg.Wallet
+	if wallet == nil {
+		// No ready wallet was passed, so try to open an existing one.
+		var pubPass []byte
+		if cfg.PublicPass == nil {
+			pubPass = defaultPubPassphrase
+		} else {
+			pubPass = cfg.PublicPass
+		}
+		loader := base.NewLoader(cfg.NetParams, netDir,
+			cfg.RecoveryWindow)
+		walletExists, err := loader.WalletExists()
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		// Wallet has been created and been initialized at this point,
-		// open it along with all the required DB namespaces, and the
-		// DB itself.
-		wallet, err = loader.OpenExistingWallet(pubPass, false)
-		if err != nil {
-			return nil, err
+
+		if !walletExists {
+			// Wallet has never been created, perform initial
+			// set up.
+			wallet, err = loader.CreateNewWallet(
+				pubPass, cfg.PrivatePass, cfg.HdSeed,
+				cfg.Birthday,
+			)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// Wallet has been created and been initialized at
+			// this point, open it along with all the required DB
+			// namespaces, and the DB itself.
+			wallet, err = loader.OpenExistingWallet(pubPass, false)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -210,7 +217,7 @@ func (b *BtcWallet) Stop() error {
 func (b *BtcWallet) ConfirmedBalance(confs int32) (btcutil.Amount, error) {
 	var balance btcutil.Amount
 
-	witnessOutputs, err := b.ListUnspentWitness(confs)
+	witnessOutputs, err := b.ListUnspentWitness(confs, math.MaxInt32)
 	if err != nil {
 		return 0, err
 	}
@@ -247,28 +254,25 @@ func (b *BtcWallet) NewAddress(t lnwallet.AddressType, change bool) (btcutil.Add
 	return b.wallet.NewAddress(defaultAccount, keyScope)
 }
 
-// GetPrivKey retrieves the underlying private key associated with the passed
-// address. If the we're unable to locate the proper private key, then a
-// non-nil error will be returned.
+// IsOurAddress checks if the passed address belongs to this wallet
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) GetPrivKey(a btcutil.Address) (*btcec.PrivateKey, error) {
-	// Using the ID address, request the private key corresponding to the
-	// address from the wallet's address manager.
-	return b.wallet.PrivKeyForAddress(a)
+func (b *BtcWallet) IsOurAddress(a btcutil.Address) bool {
+	result, err := b.wallet.HaveAddress(a)
+	return result && (err == nil)
 }
 
 // SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying out to
 // the specified outputs. In the case the wallet has insufficient funds, or the
-// outputs are non-standard, a non-nil error will be be returned.
+// outputs are non-standard, a non-nil error will be returned.
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
-	feeRate lnwallet.SatPerVByte) (*chainhash.Hash, error) {
+	feeRate lnwallet.SatPerKWeight) (*chainhash.Hash, error) {
 
-	// The fee rate is passed in using units of sat/vbyte, so we'll scale
-	// this up to sat/KB as the SendOutputs method requires this unit.
-	feeSatPerKB := btcutil.Amount(feeRate * 1000)
+	// Convert our fee rate from sat/kw to sat/kb since it's required by
+	// SendOutputs.
+	feeSatPerKB := btcutil.Amount(feeRate.FeePerKVByte())
 
 	return b.wallet.SendOutputs(outputs, defaultAccount, 1, feeSatPerKB)
 }
@@ -283,7 +287,7 @@ func (b *BtcWallet) LockOutpoint(o wire.OutPoint) {
 	b.wallet.LockOutpoint(o)
 }
 
-// UnlockOutpoint unlocks an previously locked output, marking it eligible for
+// UnlockOutpoint unlocks a previously locked output, marking it eligible for
 // coin selection.
 //
 // This is a part of the WalletController interface.
@@ -295,9 +299,9 @@ func (b *BtcWallet) UnlockOutpoint(o wire.OutPoint) {
 // controls which pay to witness programs either directly or indirectly.
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) ListUnspentWitness(minConfs int32) ([]*lnwallet.Utxo, error) {
+func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32) (
+	[]*lnwallet.Utxo, error) {
 	// First, grab all the unfiltered currently unspent outputs.
-	maxConfs := int32(math.MaxInt32)
 	unspentOutputs, err := b.wallet.ListUnspent(minConfs, maxConfs, nil)
 	if err != nil {
 		return nil, err
@@ -330,9 +334,16 @@ func (b *BtcWallet) ListUnspentWitness(minConfs int32) ([]*lnwallet.Utxo, error)
 				return nil, err
 			}
 
+			// We'll ensure we properly convert the amount given in
+			// BTC to satoshis.
+			amt, err := btcutil.NewAmount(output.Amount)
+			if err != nil {
+				return nil, err
+			}
+
 			utxo := &lnwallet.Utxo{
 				AddressType: addressType,
-				Value:       btcutil.Amount(output.Amount * 1e8),
+				Value:       amt,
 				PkScript:    pkScript,
 				OutPoint: wire.OutPoint{
 					Hash:  *txid,
@@ -508,7 +519,7 @@ func minedTransactionsToDetails(
 }
 
 // unminedTransactionsToDetail is a helper function which converts a summary
-// for a unconfirmed transaction to a transaction detail.
+// for an unconfirmed transaction to a transaction detail.
 func unminedTransactionsToDetail(
 	summary base.TransactionSummary,
 ) (*lnwallet.TransactionDetail, error) {
@@ -544,9 +555,11 @@ func (b *BtcWallet) ListTransactionDetails() ([]*lnwallet.TransactionDetail, err
 	bestBlock := b.wallet.Manager.SyncedTo()
 	currentHeight := bestBlock.Height
 
-	// TODO(roasbeef): can replace with start "wallet birthday"
+	// We'll attempt to find all unconfirmed transactions (height of -1),
+	// as well as all transactions that are known to have confirmed at this
+	// height.
 	start := base.NewBlockIdentifierFromHeight(0)
-	stop := base.NewBlockIdentifierFromHeight(bestBlock.Height)
+	stop := base.NewBlockIdentifierFromHeight(-1)
 	txns, err := b.wallet.GetTransactions(start, stop, nil)
 	if err != nil {
 		return nil, err
@@ -730,8 +743,12 @@ func (b *BtcWallet) IsSynced() (bool, int64, error) {
 		return false, 0, err
 	}
 
-	// If the timestamp no the best header is more than 2 hours in the
+	// If the timestamp on the best header is more than 2 hours in the
 	// past, then we're not yet synced.
 	minus24Hours := time.Now().Add(-2 * time.Hour)
-	return !blockHeader.Timestamp.Before(minus24Hours), bestTimestamp, nil
+	if blockHeader.Timestamp.Before(minus24Hours) {
+		return false, bestTimestamp, nil
+	}
+
+	return true, bestTimestamp, nil
 }

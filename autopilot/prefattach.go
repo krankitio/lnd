@@ -1,12 +1,13 @@
 package autopilot
 
 import (
+	"bytes"
 	"fmt"
 	prand "math/rand"
 	"time"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcutil"
 )
 
 // ConstrainedPrefAttachment is an implementation of the AttachmentHeuristic
@@ -14,7 +15,7 @@ import (
 // heuristic. This means that given a threshold to allocate to automatic
 // channel establishment, the heuristic will attempt to favor connecting to
 // nodes which already have a set amount of links, selected by sampling from a
-// power law distribution. The attachment ins non-linear in that it favors
+// power law distribution. The attachment is non-linear in that it favors
 // nodes with a higher in-degree but less so that regular linear preferential
 // attachment. As a result, this creates smaller and less clusters than regular
 // linear preferential attachment.
@@ -101,7 +102,7 @@ func (p *ConstrainedPrefAttachment) NeedMoreChans(channels []Channel,
 	return fundsAvailable, numAdditionalChans, true
 }
 
-// NodeID is a simple type that holds a EC public key serialized in compressed
+// NodeID is a simple type that holds an EC public key serialized in compressed
 // format.
 type NodeID [33]byte
 
@@ -153,6 +154,8 @@ func (p *ConstrainedPrefAttachment) Select(self *btcec.PublicKey, g ChannelGraph
 		return directives, nil
 	}
 
+	selfPubBytes := self.SerializeCompressed()
+
 	// We'll continue our attachment loop until we've exhausted the current
 	// amount of available funds.
 	visited := make(map[NodeID]struct{})
@@ -174,7 +177,7 @@ func (p *ConstrainedPrefAttachment) Select(self *btcec.PublicKey, g ChannelGraph
 		//
 		// TODO(roasbeef): add noise to make adversarially resistant?
 		if err := g.ForEachNode(func(node Node) error {
-			nID := NewNodeID(node.PubKey())
+			nID := NodeID(node.PubKey())
 
 			// Once a node has already been attached to, we'll
 			// ensure that it isn't factored into any further
@@ -186,11 +189,11 @@ func (p *ConstrainedPrefAttachment) Select(self *btcec.PublicKey, g ChannelGraph
 			// If we come across ourselves, them we'll continue in
 			// order to avoid attempting to make a channel with
 			// ourselves.
-			if node.PubKey().IsEqual(self) {
+			if bytes.Equal(nID[:], selfPubBytes) {
 				return nil
 			}
 
-			// Additionally, if this node is in the backlist, then
+			// Additionally, if this node is in the blacklist, then
 			// we'll skip it.
 			if _, ok := skipNodes[nID]; ok {
 				return nil
@@ -235,19 +238,24 @@ func (p *ConstrainedPrefAttachment) Select(self *btcec.PublicKey, g ChannelGraph
 
 		// With the node selected, we'll add this (node, amount) tuple
 		// to out set of recommended directives.
-		pub := selectedNode.PubKey()
+		pubBytes := selectedNode.PubKey()
+		pub, err := btcec.ParsePubKey(pubBytes[:], btcec.S256())
+		if err != nil {
+			return nil, err
+		}
 		directives = append(directives, AttachmentDirective{
 			// TODO(roasbeef): need curve?
-			PeerKey: &btcec.PublicKey{
+			NodeKey: &btcec.PublicKey{
 				X: pub.X,
 				Y: pub.Y,
 			},
-			Addrs: selectedNode.Addrs(),
+			NodeID: NewNodeID(pub),
+			Addrs:  selectedNode.Addrs(),
 		})
 
 		// With the node selected, we'll add it to the set of visited
 		// nodes to avoid attaching to it again.
-		visited[NewNodeID(selectedNode.PubKey())] = struct{}{}
+		visited[NodeID(pubBytes)] = struct{}{}
 	}
 
 	numSelectedNodes := int64(len(directives))

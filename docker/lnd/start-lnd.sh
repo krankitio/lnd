@@ -49,8 +49,8 @@ if [[ "$CHAIN" == "litecoin" ]]; then
     BACKEND="ltcd"
 fi
 
-lnd \
-    --noencryptwallet \
+exec lnd \
+    --noseedbackup \
     --logdir="/data" \
     "--$CHAIN.active" \
     "--$CHAIN.$NETWORK" \

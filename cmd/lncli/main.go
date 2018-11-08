@@ -14,9 +14,11 @@ import (
 
 	macaroon "gopkg.in/macaroon.v2"
 
+	"github.com/btcsuite/btcutil"
+	"github.com/lightningnetwork/lnd/build"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/macaroons"
-	"github.com/roasbeef/btcutil"
 	"github.com/urfave/cli"
 
 	"google.golang.org/grpc"
@@ -24,14 +26,17 @@ import (
 )
 
 const (
+	defaultDataDir          = "data"
+	defaultChainSubDir      = "chain"
 	defaultTLSCertFilename  = "tls.cert"
 	defaultMacaroonFilename = "admin.macaroon"
+	defaultRPCPort          = "10009"
+	defaultRPCHostPort      = "localhost:" + defaultRPCPort
 )
 
 var (
-	defaultLndDir       = btcutil.AppDataDir("lnd", false)
-	defaultTLSCertPath  = filepath.Join(defaultLndDir, defaultTLSCertFilename)
-	defaultMacaroonPath = filepath.Join(defaultLndDir, defaultMacaroonFilename)
+	defaultLndDir      = btcutil.AppDataDir("lnd", false)
+	defaultTLSCertPath = filepath.Join(defaultLndDir, defaultTLSCertFilename)
 )
 
 func fatal(err error) {
@@ -60,30 +65,14 @@ func getClient(ctx *cli.Context) (lnrpc.LightningClient, func()) {
 }
 
 func getClientConn(ctx *cli.Context, skipMacaroons bool) *grpc.ClientConn {
-	lndDir := cleanAndExpandPath(ctx.GlobalString("lnddir"))
-	if lndDir != defaultLndDir {
-		// If a custom lnd directory was set, we'll also check if custom
-		// paths for the TLS cert and macaroon file were set as well. If
-		// not, we'll override their paths so they can be found within
-		// the custom lnd directory set. This allows us to set a custom
-		// lnd directory, along with custom paths to the TLS cert and
-		// macaroon file.
-		tlsCertPath := cleanAndExpandPath(ctx.GlobalString("tlscertpath"))
-		if tlsCertPath == defaultTLSCertPath {
-			ctx.GlobalSet("tlscertpath",
-				filepath.Join(lndDir, defaultTLSCertFilename))
-		}
-
-		macPath := cleanAndExpandPath(ctx.GlobalString("macaroonpath"))
-		if macPath == defaultMacaroonPath {
-			ctx.GlobalSet("macaroonpath",
-				filepath.Join(lndDir, defaultMacaroonFilename))
-		}
+	// First, we'll parse the args from the command.
+	tlsCertPath, macPath, err := extractPathArgs(ctx)
+	if err != nil {
+		fatal(err)
 	}
 
 	// Load the specified TLS certificate and build transport credentials
 	// with it.
-	tlsCertPath := cleanAndExpandPath(ctx.GlobalString("tlscertpath"))
 	creds, err := credentials.NewClientTLSFromFile(tlsCertPath, "")
 	if err != nil {
 		fatal(err)
@@ -98,14 +87,15 @@ func getClientConn(ctx *cli.Context, skipMacaroons bool) *grpc.ClientConn {
 	// if we're not skipping macaroon processing.
 	if !ctx.GlobalBool("no-macaroons") && !skipMacaroons {
 		// Load the specified macaroon file.
-		macPath := cleanAndExpandPath(ctx.GlobalString("macaroonpath"))
 		macBytes, err := ioutil.ReadFile(macPath)
 		if err != nil {
-			fatal(err)
+			fatal(fmt.Errorf("unable to read macaroon path (check "+
+				"the network setting!): %v", err))
 		}
+
 		mac := &macaroon.Macaroon{}
 		if err = mac.UnmarshalBinary(macBytes); err != nil {
-			fatal(err)
+			fatal(fmt.Errorf("unable to decode macaroon: %v", err))
 		}
 
 		macConstraints := []macaroons.Constraint{
@@ -139,23 +129,85 @@ func getClientConn(ctx *cli.Context, skipMacaroons bool) *grpc.ClientConn {
 		opts = append(opts, grpc.WithPerRPCCredentials(cred))
 	}
 
+	// We need to use a custom dialer so we can also connect to unix sockets
+	// and not just TCP addresses.
+	opts = append(
+		opts, grpc.WithDialer(
+			lncfg.ClientAddressDialer(defaultRPCPort),
+		),
+	)
 	conn, err := grpc.Dial(ctx.GlobalString("rpcserver"), opts...)
 	if err != nil {
-		fatal(err)
+		fatal(fmt.Errorf("unable to connect to RPC server: %v", err))
 	}
 
 	return conn
 }
 
+// extractPathArgs parses the TLS certificate and macaroon paths from the
+// command.
+func extractPathArgs(ctx *cli.Context) (string, string, error) {
+	// We'll start off by parsing the active chain and network. These are
+	// needed to determine the correct path to the macaroon when not
+	// specified.
+	chain := strings.ToLower(ctx.GlobalString("chain"))
+	switch chain {
+	case "bitcoin", "litecoin":
+	default:
+		return "", "", fmt.Errorf("unknown chain: %v", chain)
+	}
+
+	network := strings.ToLower(ctx.GlobalString("network"))
+	switch network {
+	case "mainnet", "testnet", "regtest", "simnet":
+	default:
+		return "", "", fmt.Errorf("unknown network: %v", network)
+	}
+
+	// We'll now fetch the lnddir so we can make a decision  on how to
+	// properly read the macaroons (if needed) and also the cert. This will
+	// either be the default, or will have been overwritten by the end
+	// user.
+	lndDir := cleanAndExpandPath(ctx.GlobalString("lnddir"))
+
+	// If the macaroon path as been manually provided, then we'll only
+	// target the specified file.
+	var macPath string
+	if ctx.GlobalString("macaroonpath") != "" {
+		macPath = cleanAndExpandPath(ctx.GlobalString("macaroonpath"))
+	} else {
+		// Otherwise, we'll go into the path:
+		// lnddir/data/chain/<chain>/<network> in order to fetch the
+		// macaroon that we need.
+		macPath = filepath.Join(
+			lndDir, defaultDataDir, defaultChainSubDir, chain,
+			network, defaultMacaroonFilename,
+		)
+	}
+
+	tlsCertPath := cleanAndExpandPath(ctx.GlobalString("tlscertpath"))
+
+	// If a custom lnd directory was set, we'll also check if custom paths
+	// for the TLS cert and macaroon file were set as well. If not, we'll
+	// override their paths so they can be found within the custom lnd
+	// directory set. This allows us to set a custom lnd directory, along
+	// with custom paths to the TLS cert and macaroon file.
+	if lndDir != defaultLndDir {
+		tlsCertPath = filepath.Join(lndDir, defaultTLSCertFilename)
+	}
+
+	return tlsCertPath, macPath, nil
+}
+
 func main() {
 	app := cli.NewApp()
 	app.Name = "lncli"
-	app.Version = "0.4"
+	app.Version = build.Version()
 	app.Usage = "control plane for your Lightning Network Daemon (lnd)"
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "rpcserver",
-			Value: "localhost:10009",
+			Value: defaultRPCHostPort,
 			Usage: "host:port of ln daemon",
 		},
 		cli.StringFlag{
@@ -168,13 +220,23 @@ func main() {
 			Value: defaultTLSCertPath,
 			Usage: "path to TLS certificate",
 		},
+		cli.StringFlag{
+			Name:  "chain, c",
+			Usage: "the chain lnd is running on e.g. bitcoin",
+			Value: "bitcoin",
+		},
+		cli.StringFlag{
+			Name: "network, n",
+			Usage: "the network lnd is running on e.g. mainnet, " +
+				"testnet, etc.",
+			Value: "mainnet",
+		},
 		cli.BoolFlag{
 			Name:  "no-macaroons",
 			Usage: "disable macaroon authentication",
 		},
 		cli.StringFlag{
 			Name:  "macaroonpath",
-			Value: defaultMacaroonPath,
 			Usage: "path to macaroon file",
 		},
 		cli.Int64Flag{
@@ -190,6 +252,7 @@ func main() {
 	app.Commands = []cli.Command{
 		createCommand,
 		unlockCommand,
+		changePasswordCommand,
 		newAddressCommand,
 		sendManyCommand,
 		sendCoinsCommand,
@@ -198,6 +261,7 @@ func main() {
 		openChannelCommand,
 		closeChannelCommand,
 		closeAllChannelsCommand,
+		abandonChannelCommand,
 		listPeersCommand,
 		walletBalanceCommand,
 		channelBalanceCommand,
@@ -205,10 +269,12 @@ func main() {
 		pendingChannelsCommand,
 		sendPaymentCommand,
 		payInvoiceCommand,
+		sendToRouteCommand,
 		addInvoiceCommand,
 		lookupInvoiceCommand,
 		listInvoicesCommand,
 		listChannelsCommand,
+		closedChannelsCommand,
 		listPaymentsCommand,
 		describeGraphCommand,
 		getChanInfoCommand,
@@ -235,10 +301,13 @@ func main() {
 // passed path, cleans the result, and returns it.
 // This function is taken from https://github.com/btcsuite/btcd
 func cleanAndExpandPath(path string) string {
+	if path == "" {
+		return ""
+	}
+
 	// Expand initial ~ to OS specific home directory.
 	if strings.HasPrefix(path, "~") {
 		var homeDir string
-
 		user, err := user.Current()
 		if err == nil {
 			homeDir = user.HomeDir

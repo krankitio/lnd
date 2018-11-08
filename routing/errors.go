@@ -31,13 +31,26 @@ const (
 	ErrTargetNotInNetwork
 
 	// ErrOutdated is returned when the routing update already have
-	// been applied.
+	// been applied, or a newer update is already known.
 	ErrOutdated
 
 	// ErrIgnored is returned when the update have been ignored because
 	// this update can't bring us something new, or because a node
 	// announcement was given for node not found in any channel.
 	ErrIgnored
+
+	// ErrRejected is returned if the update is for a channel ID that was
+	// previously added to the reject cache because of an invalid update
+	// was attempted to be processed.
+	ErrRejected
+
+	// ErrPaymentAttemptTimeout is an error that indicates that a payment
+	// attempt timed out before we were able to successfully route an HTLC.
+	ErrPaymentAttemptTimeout
+
+	// ErrFeeLimitExceeded is returned when the total fees of a route exceed
+	// the user-specified fee limit.
+	ErrFeeLimitExceeded
 )
 
 // routerError is a structure that represent the error inside the routing package,
@@ -57,7 +70,7 @@ func (e *routerError) Error() string {
 // A compile time check to ensure routerError implements the error interface.
 var _ error = (*routerError)(nil)
 
-// newErr creates an routerError by the given error description and its
+// newErr creates a routerError by the given error description and its
 // corresponding error code.
 func newErr(code errorCode, a interface{}) *routerError {
 	return &routerError{
@@ -66,7 +79,7 @@ func newErr(code errorCode, a interface{}) *routerError {
 	}
 }
 
-// newErrf creates an routerError by the given error formatted description and
+// newErrf creates a routerError by the given error formatted description and
 // its corresponding error code.
 func newErrf(code errorCode, format string, a ...interface{}) *routerError {
 	return &routerError{

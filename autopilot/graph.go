@@ -7,11 +7,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcutil"
 	"github.com/coreos/bbolt"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcutil"
 )
 
 var (
@@ -22,7 +22,7 @@ var (
 	_, _ = testSig.R.SetString("63724406601629180062774974542967536251589935445068131219452686511677818569431", 10)
 	_, _ = testSig.S.SetString("18801056069249825825291287104931333862866033135609736119018462340006816851118", 10)
 
-	chanIDCounter uint64
+	chanIDCounter uint64 // To be used atomically.
 )
 
 // databaseChannelGraph wraps a channeldb.ChannelGraph instance with the
@@ -37,7 +37,7 @@ type databaseChannelGraph struct {
 // autopilot.ChannelGraph interface.
 var _ ChannelGraph = (*databaseChannelGraph)(nil)
 
-// ChannelGraphFromDatabase returns a instance of the autopilot.ChannelGraph
+// ChannelGraphFromDatabase returns an instance of the autopilot.ChannelGraph
 // backed by a live, open channeldb instance.
 func ChannelGraphFromDatabase(db *channeldb.ChannelGraph) ChannelGraph {
 	return &databaseChannelGraph{
@@ -59,12 +59,12 @@ type dbNode struct {
 var _ Node = (*dbNode)(nil)
 
 // PubKey is the identity public key of the node. This will be used to attempt
-// to target a node for channel opening by the main autopilot agent.
+// to target a node for channel opening by the main autopilot agent. The key
+// will be returned in serialized compressed format.
 //
 // NOTE: Part of the autopilot.Node interface.
-func (d dbNode) PubKey() *btcec.PublicKey {
-	pubKey, _ := d.node.PubKey()
-	return pubKey
+func (d dbNode) PubKey() [33]byte {
+	return d.node.PubKeyBytes
 }
 
 // Addrs returns a slice of publicly reachable public TCP addresses that the
@@ -85,13 +85,23 @@ func (d dbNode) ForEachChannel(cb func(ChannelEdge) error) error {
 	return d.node.ForEachChannel(d.tx, func(tx *bolt.Tx,
 		ei *channeldb.ChannelEdgeInfo, ep, _ *channeldb.ChannelEdgePolicy) error {
 
-		pubkey, _ := ep.Node.PubKey()
+		// Skip channels for which no outgoing edge policy is available.
+		//
+		// TODO(joostjager): Ideally the case where channels have a nil
+		// policy should be supported, as autopilot is not looking at
+		// the policies. For now, it is not easily possible to get a
+		// reference to the other end LightningNode object without
+		// retrieving the policy.
+		if ep == nil {
+			return nil
+		}
+
 		edge := ChannelEdge{
 			Channel: Channel{
 				ChanID:    lnwire.NewShortChanIDFromInt(ep.ChannelID),
 				Capacity:  ei.Capacity,
 				FundedAmt: ei.Capacity,
-				Node:      NewNodeID(pubkey),
+				Node:      NodeID(ep.Node.PubKeyBytes),
 			},
 			Peer: dbNode{
 				tx:   tx,
@@ -219,7 +229,7 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		MinHTLC:                   1,
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
-		Flags: 0,
+		Flags:                     0,
 	}
 
 	if err := d.db.UpdateEdgePolicy(edgePolicy); err != nil {
@@ -233,7 +243,7 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		MinHTLC:                   1,
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
-		Flags: 1,
+		Flags:                     1,
 	}
 	if err := d.db.UpdateEdgePolicy(edgePolicy); err != nil {
 		return nil, nil, err
@@ -260,7 +270,7 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		nil
 }
 
-// memChannelGraph is a implementation of the autopilot.ChannelGraph backed by
+// memChannelGraph is an implementation of the autopilot.ChannelGraph backed by
 // an in-memory graph.
 type memChannelGraph struct {
 	graph map[NodeID]memNode
@@ -395,8 +405,11 @@ var _ Node = (*memNode)(nil)
 // to target a node for channel opening by the main autopilot agent.
 //
 // NOTE: Part of the autopilot.Node interface.
-func (m memNode) PubKey() *btcec.PublicKey {
-	return m.pub
+func (m memNode) PubKey() [33]byte {
+	var n [33]byte
+	copy(n[:], m.pub.SerializeCompressed())
+
+	return n
 }
 
 // Addrs returns a slice of publicly reachable public TCP addresses that the

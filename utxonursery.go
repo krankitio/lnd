@@ -8,14 +8,16 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/lightningnetwork/lnd/sweep"
+
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/davecgh/go-spew/spew"
+
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/roasbeef/btcd/blockchain"
-	"github.com/roasbeef/btcd/txscript"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
 
 //                          SUMMARY OF OUTPUT STATES
@@ -181,17 +183,19 @@ type NurseryConfig struct {
 	// determining outputs in the chain as confirmed.
 	ConfDepth uint32
 
-	// DB provides access to a user's channels, such that they can be marked
-	// fully closed after incubation has concluded.
-	DB *channeldb.DB
+	// SweepTxConfTarget assigns a confirmation target for sweep txes on
+	// which the fee calculation will be based.
+	SweepTxConfTarget uint32
 
-	// Estimator is used when crafting sweep transactions to estimate the
-	// necessary fee relative to the expected size of the sweep transaction.
-	Estimator lnwallet.FeeEstimator
+	// FetchClosedChannels provides access to a user's channels, such that
+	// they can be marked fully closed after incubation has concluded.
+	FetchClosedChannels func(pendingOnly bool) (
+		[]*channeldb.ChannelCloseSummary, error)
 
-	// GenSweepScript generates a P2WKH script belonging to the wallet where
-	// funds can be swept.
-	GenSweepScript func() ([]byte, error)
+	// FetchClosedChannel provides access to the close summary to extract a
+	// height hint from.
+	FetchClosedChannel func(chanID *wire.OutPoint) (
+		*channeldb.ChannelCloseSummary, error)
 
 	// Notifier provides the utxo nursery the ability to subscribe to
 	// transaction confirmation events, which advance outputs through their
@@ -202,13 +206,13 @@ type NurseryConfig struct {
 	// transaction to the appropriate network.
 	PublishTransaction func(*wire.MsgTx) error
 
-	// Signer is used by the utxo nursery to generate valid witnesses at the
-	// time the incubated outputs need to be spent.
-	Signer lnwallet.Signer
-
 	// Store provides access to and modification of the persistent state
 	// maintained about the utxo nursery's incubating outputs.
 	Store NurseryStore
+
+	// Sweeper provides functionality to generate sweep transactions.
+	// Nursery uses this to sweep final outputs back into the wallet.
+	Sweeper *sweep.UtxoSweeper
 }
 
 // utxoNursery is a system dedicated to incubating time-locked outputs created
@@ -220,8 +224,8 @@ type NurseryConfig struct {
 // the source wallet, returning the outputs so they can be used within future
 // channels, or regular Bitcoin transactions.
 type utxoNursery struct {
-	started uint32
-	stopped uint32
+	started uint32 // To be used atomically.
+	stopped uint32 // To be used atomically.
 
 	cfg *NurseryConfig
 
@@ -257,7 +261,7 @@ func (u *utxoNursery) Start() error {
 	// connected block. We register immediately on startup to ensure that
 	// no blocks are missed while we are handling blocks that were missed
 	// during the time the UTXO nursery was unavailable.
-	newBlockChan, err := u.cfg.Notifier.RegisterBlockEpochNtfn()
+	newBlockChan, err := u.cfg.Notifier.RegisterBlockEpochNtfn(nil)
 	if err != nil {
 		return err
 	}
@@ -266,7 +270,7 @@ func (u *utxoNursery) Start() error {
 
 	// Load any pending close channels, which represents the super set of
 	// all channels that may still be incubating.
-	pendingCloseChans, err := u.cfg.DB.FetchClosedChannels(true)
+	pendingCloseChans, err := u.cfg.FetchClosedChannels(true)
 	if err != nil {
 		newBlockChan.Cancel()
 		return err
@@ -343,7 +347,23 @@ func (u *utxoNursery) Stop() error {
 func (u *utxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 	commitResolution *lnwallet.CommitOutputResolution,
 	outgoingHtlcs []lnwallet.OutgoingHtlcResolution,
-	incomingHtlcs []lnwallet.IncomingHtlcResolution) error {
+	incomingHtlcs []lnwallet.IncomingHtlcResolution,
+	broadcastHeight uint32) error {
+
+	// Add to wait group because nursery might shut down during execution of
+	// this function. Otherwise it could happen that nursery thinks it is
+	// shut down, but in this function new goroutines were started and stay
+	// around.
+	u.wg.Add(1)
+	defer u.wg.Done()
+
+	// Check quit channel for the case where the waitgroup wait was finished
+	// right before this function's add call was made.
+	select {
+	case <-u.quit:
+		return fmt.Errorf("nursery shutting down")
+	default:
+	}
 
 	numHtlcs := len(incomingHtlcs) + len(outgoingHtlcs)
 	var (
@@ -351,7 +371,7 @@ func (u *utxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 
 		// Kid outputs can be swept after an initial confirmation
 		// followed by a maturity period.Baby outputs are two stage and
-		// will need to wait for a absolute time out to reach a
+		// will need to wait for an absolute time out to reach a
 		// confirmation, then require a relative confirmation delay.
 		kidOutputs  = make([]kidOutput, 0, 1+len(incomingHtlcs))
 		babyOutputs = make([]babyOutput, 0, len(outgoingHtlcs))
@@ -469,7 +489,9 @@ func (u *utxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 	// kindergarten bucket.
 	if len(kidOutputs) != 0 {
 		for _, kidOutput := range kidOutputs {
-			err := u.registerPreschoolConf(&kidOutput, u.bestHeight)
+			err := u.registerPreschoolConf(
+				&kidOutput, broadcastHeight,
+			)
 			if err != nil {
 				return err
 			}
@@ -621,7 +643,7 @@ func (u *utxoNursery) reloadPreschool() error {
 		chanPoint := kid.OriginChanPoint()
 
 		// Load the close summary for this output's channel point.
-		closeSummary, err := u.cfg.DB.FetchClosedChannel(chanPoint)
+		closeSummary, err := u.cfg.FetchClosedChannel(chanPoint)
 		if err == channeldb.ErrClosedChannelNotFound {
 			// This should never happen since the close summary
 			// should only be removed after the channel has been
@@ -736,7 +758,7 @@ func (u *utxoNursery) regraduateClass(classHeight uint32) error {
 		utxnLog.Infof("Re-registering confirmation for kindergarten "+
 			"sweep transaction at height=%d ", classHeight)
 
-		err = u.registerSweepConf(finalTx, kgtnOutputs, classHeight)
+		err = u.sweepMatureOutputs(classHeight, finalTx, kgtnOutputs)
 		if err != nil {
 			utxnLog.Errorf("Failed to re-register for kindergarten "+
 				"sweep transaction at height=%d: %v",
@@ -854,7 +876,15 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 		// generated a sweep txn for this height. Generate one if there
 		// are kindergarten outputs or cltv crib outputs to be spent.
 		if len(kgtnOutputs) > 0 {
-			finalTx, err = u.createSweepTx(kgtnOutputs, classHeight)
+			sweepInputs := make([]sweep.Input, len(kgtnOutputs))
+			for i := range kgtnOutputs {
+				sweepInputs[i] = &kgtnOutputs[i]
+			}
+
+			finalTx, err = u.cfg.Sweeper.CreateSweepTx(
+				sweepInputs, u.cfg.SweepTxConfTarget,
+				classHeight,
+			)
 			if err != nil {
 				utxnLog.Errorf("Failed to create sweep txn at "+
 					"height=%d", classHeight)
@@ -910,203 +940,6 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 	return u.cfg.Store.GraduateHeight(classHeight)
 }
 
-// craftSweepTx accepts accepts a list of kindergarten outputs, and baby
-// outputs which don't required a second-layer claim, and signs and generates a
-// signed txn that spends from them. This method also makes an accurate fee
-// estimate before generating the required witnesses.
-func (u *utxoNursery) createSweepTx(kgtnOutputs []kidOutput,
-	classHeight uint32) (*wire.MsgTx, error) {
-
-	// Create a transaction which sweeps all the newly mature outputs into
-	// a output controlled by the wallet.
-
-	// TODO(roasbeef): can be more intelligent about buffering outputs to
-	// be more efficient on-chain.
-
-	// Assemble the kindergarten class into a slice csv spendable outputs,
-	// and also a set of regular spendable outputs. The set of regular
-	// outputs are CLTV locked outputs that have had their timelocks
-	// expire.
-	var (
-		csvOutputs     []CsvSpendableOutput
-		cltvOutputs    []SpendableOutput
-		weightEstimate lnwallet.TxWeightEstimator
-	)
-
-	// Allocate enough room for both types of kindergarten outputs.
-	csvOutputs = make([]CsvSpendableOutput, 0, len(kgtnOutputs))
-	cltvOutputs = make([]SpendableOutput, 0, len(kgtnOutputs))
-
-	// Our sweep transaction will pay to a single segwit p2wkh address,
-	// ensure it contributes to our weight estimate.
-	weightEstimate.AddP2WKHOutput()
-
-	// For each kindergarten output, use its witness type to determine the
-	// estimate weight of its witness, and add it to the proper set of
-	// spendable outputs.
-	for i := range kgtnOutputs {
-		input := &kgtnOutputs[i]
-
-		switch input.WitnessType() {
-
-		// Outputs on a past commitment transaction that pay directly
-		// to us.
-		case lnwallet.CommitmentTimeLock:
-			weightEstimate.AddWitnessInput(
-				lnwallet.ToLocalTimeoutWitnessSize,
-			)
-			csvOutputs = append(csvOutputs, input)
-
-		// Outgoing second layer HTLC's that have confirmed within the
-		// chain, and the output they produced is now mature enough to
-		// sweep.
-		case lnwallet.HtlcOfferedTimeoutSecondLevel:
-			weightEstimate.AddWitnessInput(
-				lnwallet.SecondLevelHtlcSuccessWitnessSize,
-			)
-			csvOutputs = append(csvOutputs, input)
-
-		// Incoming second layer HTLC's that have confirmed within the
-		// chain, and the output they produced is now mature enough to
-		// sweep.
-		case lnwallet.HtlcAcceptedSuccessSecondLevel:
-			weightEstimate.AddWitnessInput(
-				lnwallet.SecondLevelHtlcSuccessWitnessSize,
-			)
-			csvOutputs = append(csvOutputs, input)
-
-		// An HTLC on the commitment transaction of the remote party,
-		// that has had its absolute timelock expire.
-		case lnwallet.HtlcOfferedRemoteTimeout:
-			weightEstimate.AddWitnessInput(
-				lnwallet.AcceptedHtlcTimeoutWitnessSize,
-			)
-			cltvOutputs = append(cltvOutputs, input)
-
-		default:
-			utxnLog.Warnf("kindergarten output in nursery store "+
-				"contains unexpected witness type: %v",
-				input.WitnessType())
-			continue
-		}
-	}
-
-	utxnLog.Infof("Creating sweep transaction for %v CSV inputs, %v CLTV "+
-		"inputs", len(csvOutputs), len(cltvOutputs))
-
-	txVSize := int64(weightEstimate.VSize())
-	return u.populateSweepTx(txVSize, classHeight, csvOutputs, cltvOutputs)
-}
-
-// populateSweepTx populate the final sweeping transaction with all witnesses
-// in place for all inputs using the provided txn fee. The created transaction
-// has a single output sending all the funds back to the source wallet, after
-// accounting for the fee estimate.
-func (u *utxoNursery) populateSweepTx(txVSize int64, classHeight uint32,
-	csvInputs []CsvSpendableOutput,
-	cltvInputs []SpendableOutput) (*wire.MsgTx, error) {
-
-	// Generate the receiving script to which the funds will be swept.
-	pkScript, err := u.cfg.GenSweepScript()
-	if err != nil {
-		return nil, err
-	}
-
-	// Sum up the total value contained in the inputs.
-	var totalSum btcutil.Amount
-	for _, o := range csvInputs {
-		totalSum += o.Amount()
-	}
-	for _, o := range cltvInputs {
-		totalSum += o.Amount()
-	}
-
-	// Using the txn weight estimate, compute the required txn fee.
-	feePerVSize, err := u.cfg.Estimator.EstimateFeePerVSize(6)
-	if err != nil {
-		return nil, err
-	}
-	txFee := feePerVSize.FeeForVSize(txVSize)
-
-	// Sweep as much possible, after subtracting txn fees.
-	sweepAmt := int64(totalSum - txFee)
-
-	// Create the sweep transaction that we will be building. We use
-	// version 2 as it is required for CSV. The txn will sweep the amount
-	// after fees to the pkscript generated above.
-	sweepTx := wire.NewMsgTx(2)
-	sweepTx.AddTxOut(&wire.TxOut{
-		PkScript: pkScript,
-		Value:    sweepAmt,
-	})
-
-	// We'll also ensure that the transaction has the required lock time if
-	// we're sweeping any cltvInputs.
-	if len(cltvInputs) > 0 {
-		sweepTx.LockTime = classHeight
-	}
-
-	// Add all inputs to the sweep transaction. Ensure that for each
-	// csvInput, we set the sequence number properly.
-	for _, input := range csvInputs {
-		sweepTx.AddTxIn(&wire.TxIn{
-			PreviousOutPoint: *input.OutPoint(),
-			Sequence:         input.BlocksToMaturity(),
-		})
-	}
-	for _, input := range cltvInputs {
-		sweepTx.AddTxIn(&wire.TxIn{
-			PreviousOutPoint: *input.OutPoint(),
-		})
-	}
-
-	// Before signing the transaction, check to ensure that it meets some
-	// basic validity requirements.
-	// TODO(conner): add more control to sanity checks, allowing us to delay
-	// spending "problem" outputs, e.g. possibly batching with other classes
-	// if fees are too low.
-	btx := btcutil.NewTx(sweepTx)
-	if err := blockchain.CheckTransactionSanity(btx); err != nil {
-		return nil, err
-	}
-
-	hashCache := txscript.NewTxSigHashes(sweepTx)
-
-	// With all the inputs in place, use each output's unique witness
-	// function to generate the final witness required for spending.
-	addWitness := func(idx int, tso SpendableOutput) error {
-		witness, err := tso.BuildWitness(
-			u.cfg.Signer, sweepTx, hashCache, idx,
-		)
-		if err != nil {
-			return err
-		}
-
-		sweepTx.TxIn[idx].Witness = witness
-
-		return nil
-	}
-
-	// Finally we'll attach a valid witness to each csv and cltv input
-	// within the sweeping transaction.
-	for i, input := range csvInputs {
-		if err := addWitness(i, input); err != nil {
-			return nil, err
-		}
-	}
-
-	// Add offset to relative indexes so cltv witnesses don't overwrite csv
-	// witnesses.
-	offset := len(csvInputs)
-	for i, input := range cltvInputs {
-		if err := addWitness(offset+i, input); err != nil {
-			return nil, err
-		}
-	}
-
-	return sweepTx, nil
-}
-
 // sweepMatureOutputs generates and broadcasts the transaction that transfers
 // control of funds from a prior channel commitment transaction to the user's
 // wallet. The outputs swept were previously time locked (either absolute or
@@ -1124,7 +957,8 @@ func (u *utxoNursery) sweepMatureOutputs(classHeight uint32, finalTx *wire.MsgTx
 	// With the sweep transaction fully signed, broadcast the transaction
 	// to the network. Additionally, we can stop tracking these outputs as
 	// they've just been swept.
-	if err := u.cfg.PublishTransaction(finalTx); err != nil {
+	err := u.cfg.PublishTransaction(finalTx)
+	if err != nil && err != lnwallet.ErrDoubleSpend {
 		utxnLog.Errorf("unable to broadcast sweep tx: %v, %v",
 			err, spew.Sdump(finalTx))
 		return err
@@ -1144,7 +978,9 @@ func (u *utxoNursery) registerSweepConf(finalTx *wire.MsgTx,
 	finalTxID := finalTx.TxHash()
 
 	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-		&finalTxID, u.cfg.ConfDepth, heightHint)
+		&finalTxID, finalTx.TxOut[0].PkScript, u.cfg.ConfDepth,
+		heightHint,
+	)
 	if err != nil {
 		utxnLog.Errorf("unable to register notification for "+
 			"sweep confirmation: %v", finalTxID)
@@ -1230,7 +1066,8 @@ func (u *utxoNursery) sweepCribOutput(classHeight uint32, baby *babyOutput) erro
 
 	// We'll now broadcast the HTLC transaction, then wait for it to be
 	// confirmed before transitioning it to kindergarten.
-	if err := u.cfg.PublishTransaction(baby.timeoutTx); err != nil {
+	err := u.cfg.PublishTransaction(baby.timeoutTx)
+	if err != nil && err != lnwallet.ErrDoubleSpend {
 		utxnLog.Errorf("Unable to broadcast baby tx: "+
 			"%v, %v", err, spew.Sdump(baby.timeoutTx))
 		return err
@@ -1249,7 +1086,9 @@ func (u *utxoNursery) registerTimeoutConf(baby *babyOutput, heightHint uint32) e
 
 	// Register for the confirmation of presigned htlc txn.
 	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-		&birthTxID, u.cfg.ConfDepth, heightHint)
+		&birthTxID, baby.timeoutTx.TxOut[0].PkScript, u.cfg.ConfDepth,
+		heightHint,
+	)
 	if err != nil {
 		return err
 	}
@@ -1314,8 +1153,10 @@ func (u *utxoNursery) registerPreschoolConf(kid *kidOutput, heightHint uint32) e
 	// de-duplicate
 	//  * need to do above?
 
-	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(&txID,
-		u.cfg.ConfDepth, heightHint)
+	pkScript := kid.signDesc.Output.PkScript
+	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
+		&txID, pkScript, u.cfg.ConfDepth, heightHint,
+	)
 	if err != nil {
 		return err
 	}
@@ -1541,7 +1382,7 @@ func (c *contractMaturityReport) AddLimboStage2Htlc(kid *kidOutput) {
 	c.htlcs = append(c.htlcs, htlcReport)
 }
 
-// AddRecoveredHtlc adds an graduate output to the maturity report's htlcs, and
+// AddRecoveredHtlc adds a graduate output to the maturity report's htlcs, and
 // contributes its amount to the recovered balance.
 func (c *contractMaturityReport) AddRecoveredHtlc(kid *kidOutput) {
 	c.recoveredBalance += kid.Amount()
@@ -1600,29 +1441,6 @@ func newSweepPkScript(wallet lnwallet.WalletController) ([]byte, error) {
 	}
 
 	return txscript.PayToAddrScript(sweepAddr)
-}
-
-// CsvSpendableOutput is a SpendableOutput that contains all of the information
-// necessary to construct, sign, and sweep an output locked with a CSV delay.
-type CsvSpendableOutput interface {
-	SpendableOutput
-
-	// ConfHeight returns the height at which this output was confirmed.
-	// A zero value indicates that the output has not been confirmed.
-	ConfHeight() uint32
-
-	// SetConfHeight marks the height at which the output is confirmed in
-	// the chain.
-	SetConfHeight(height uint32)
-
-	// BlocksToMaturity returns the relative timelock, as a number of
-	// blocks, that must be built on top of the confirmation height before
-	// the output can be spent.
-	BlocksToMaturity() uint32
-
-	// OriginChanPoint returns the outpoint of the channel from which this
-	// output is derived.
-	OriginChanPoint() *wire.OutPoint
 }
 
 // babyOutput represents a two-stage CSV locked output, and is used to track
@@ -1936,7 +1754,7 @@ func readTxOut(r io.Reader, txo *wire.TxOut) error {
 	return nil
 }
 
-// Compile-time constraint to ensure kidOutput and babyOutput implement the
-// CsvSpendableOutput interface.
-var _ CsvSpendableOutput = (*kidOutput)(nil)
-var _ CsvSpendableOutput = (*babyOutput)(nil)
+// Compile-time constraint to ensure kidOutput implements the
+// Input interface.
+
+var _ sweep.Input = (*kidOutput)(nil)
